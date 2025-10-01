@@ -1,0 +1,4 @@
+# Ignore all vscode, pycache and log at all levels
+**/.vscode/
+**/__pycache__/ 
+**/log/
