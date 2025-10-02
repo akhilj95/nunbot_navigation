@@ -120,7 +120,7 @@ class SimpleWaypointNavigator(Node):
             0,     0,     0,     0,     0,     0.05 # yaw variance
         ]
         self.initial_pose_pub.publish(initial_pose_msg)
-        self.get_logger().info('Initial pose published. Waiting 10 seconds for AMCL stabilization.')
+        self.get_logger().info('Initial pose published. Waiting 5 seconds for AMCL stabilization.')
 
         # Wait for 10 seconds as specified
         self.initialization_start_time = self.get_clock().now()
@@ -128,8 +128,8 @@ class SimpleWaypointNavigator(Node):
 
         self.amcl_initialized = False  # Reset till next message
 
-        # Wait here 10 seconds
-        time.sleep(10.0)
+        # Wait here 5 seconds
+        time.sleep(5.0)
                    
 
     def amcl_pose_callback(self, msg):
@@ -255,9 +255,10 @@ class SimpleWaypointNavigator(Node):
         # Convert costmap data (usually a flat list) into a numpy array with shape (height, width)
         costmap_array = np.array(data).reshape((height, width))
 
-        # Check if there are at least 6 values greater than 50
+        # Check how many cells have values greater than 50
         count_high_prob = np.sum(costmap_array > 50)
         
+        # Check if atleast 10 cells have these
         if count_high_prob >= 10:
             return True
         else:
