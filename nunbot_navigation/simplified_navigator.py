@@ -29,13 +29,21 @@ class SimpleWaypointNavigator(Node):
 
         # Parameters and state
         self.initial_pose = [0.0, 0.0, 0.0]  # x,y, theta
+        
+        self.waypoints = [
+            [0.75, 0.5],
+            [0.1, 0.2],
+            [-0.3,0.2]
+        ]
+
+        """  
         self.waypoints = [
             [0.75, 0.2],
             [1.48, 0.1],   # [2.48, 0.1]
             [4.6, 1.2],   # Define B, C, D coords here
-            [7, 2.3],
-            [7.8, 1.4]
+            [7, 2.3]
         ]
+        """
         self.current_waypoint_idx = 0
         self.forward = True  # traversing waypoints
 
