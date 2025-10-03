@@ -45,7 +45,7 @@ class SimpleWaypointNavigator(Node):
         ]
         """
         self.current_waypoint_idx = 0
-        self.forward = True  # for traversing waypoints list in forward/backward 
+        self.forward = True  # traversing waypoints
 
         # Navigation parameters
         self.linear_speed = 0.16  # m/s
@@ -110,7 +110,7 @@ class SimpleWaypointNavigator(Node):
         initial_pose_msg.pose.pose.orientation.z = q[2]
         initial_pose_msg.pose.pose.orientation.w = q[3]
         # Covariance small for certainty
-        # initial_pose_msg.pose.covariance = [0.01]*36
+        initial_pose_msg.pose.covariance = [0.01]*36
         initial_pose_msg.pose.covariance = [
             0.005, 0,     0,     0,     0,     0,    # variance x
             0,     0.005, 0,     0,     0,     0,    # variance y
@@ -122,7 +122,7 @@ class SimpleWaypointNavigator(Node):
         self.initial_pose_pub.publish(initial_pose_msg)
         self.get_logger().info('Initial pose published. Waiting 5 seconds for AMCL stabilization.')
 
-        # Wait for 5 seconds as specified
+        # Wait for 10 seconds as specified
         self.initialization_start_time = self.get_clock().now()
         self.state = NavigationState.WAITING_FOR_AMCL
 
@@ -131,27 +131,6 @@ class SimpleWaypointNavigator(Node):
         # Wait here 5 seconds
         time.sleep(5.0)
                    
-    def send_pose(self,pose):
-        # Publish initial pose to AMCL
-        pose_msg = PoseWithCovarianceStamped()
-        pose_msg.header.stamp = self.get_clock().now().to_msg()
-        pose_msg.header.frame_id = 'map'
-        pose_msg.pose.pose = pose
-
-        # Covariance small for certainty
-        pose_msg.pose.covariance = [0.01]*36
-
-        self.initial_pose_pub.publish(pose_msg)
-        self.get_logger().info('Last known pose published. Waiting 5 seconds for AMCL stabilization.')
-
-        # Wait for 5 seconds as specified
-        self.initialization_start_time = self.get_clock().now()
-        self.state = NavigationState.WAITING_FOR_AMCL
-
-        self.amcl_initialized = False  # Reset till next message
-
-        # Wait here 5 seconds
-        time.sleep(5.0)
 
     def amcl_pose_callback(self, msg):
         self.amcl_pose = msg.pose.pose
@@ -213,10 +192,10 @@ class SimpleWaypointNavigator(Node):
             return
 
         elif self.state == NavigationState.WAITING_FOR_AMCL:
-            # Wait for 10 seconds, then check if AMCL is initialized
+            # Wait for 15 seconds, then check if AMCL is initialized
             elapsed = (current_time - self.initialization_start_time).nanoseconds / 1e9
 
-            if elapsed > 10.0:  # 10 seconds elapsed
+            if elapsed > 15.0:  # 15 seconds elapsed
                 if self.amcl_initialized:
                     self.get_logger().info('AMCL initialized successfully!')
                     self.state = NavigationState.NAVIGATING
@@ -284,6 +263,68 @@ class SimpleWaypointNavigator(Node):
             return True
         else:
             return False
+
+
+    def is_obstacle_in_cone(self):
+        # Process latest_costmap to detect obstacles in 30 deg cone, 1m range in front
+        # Assuming costmap is an OccupancyGrid with info: resolution, width, height, origin
+        costmap = self.latest_costmap
+        if costmap is None:
+            self.get_logger().warning('Cannot get costmap')
+            return True
+
+        # Parameters for cone
+        cone_angle_rad = math.radians(self.obstacle_check_angle)
+        max_range = self.obstacle_check_distance
+
+        resolution = costmap.info.resolution
+        width = costmap.info.width
+        height = costmap.info.height
+
+        # Costmap origin pose (map frame)
+        origin_x = costmap.info.origin.position.x
+        origin_y = costmap.info.origin.position.y
+
+        data = costmap.data
+
+        # Costmap origin is w.r.t map frame
+
+        # Convert robot map coordinates to costmap indices
+        # Robot is at origin in local frame, get robot map pose from AMCL
+        robot_pose = self.amcl_pose
+        if robot_pose is None:
+            self.get_logger().warning('Cannot get amcl pose')
+            return True
+
+        robot_map_x = robot_pose.position.x
+        robot_map_y = robot_pose.position.y
+        robot_yaw = self.get_yaw_from_quaternion(robot_pose.orientation)
+
+        # Scan costmap cells in bounding box with offset by costmap origin
+        for i in range(width):
+            for j in range(height):
+                # Cell center coordinates in map frame
+                cell_x = origin_x + (i + 0.5) * resolution
+                cell_y = origin_y + (j + 0.5) * resolution
+
+                # Vector from robot to cell
+                dx = cell_x - robot_map_x
+                dy = cell_y - robot_map_y
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist > max_range or dist == 0.0:
+                    continue
+
+                # Angle in robot frame, normalize between -pi, pi
+                angle = math.atan2(dy, dx) - robot_yaw
+                angle = (angle + math.pi) % (2 * math.pi) - math.pi
+
+                if abs(angle) <= cone_angle_rad / 2.0:
+                    # Check costmap cell occupancy > threshold (e.g. 50)
+                    idx = j * width + i
+                    if data[idx] > 50:
+                        return True
+
+        return False
 
     def execute_navigation_step(self):
         """Execute one step of the navigation process"""
