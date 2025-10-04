@@ -30,17 +30,19 @@ class SimpleWaypointNavigator(Node):
         # Parameters and state
         self.initial_pose = [0.0, 0.0, 0.0]  # x,y, theta
         
+        # Waypoints at the lab 
         self.waypoints = [
             [0.75, 0.5],
-            [0.1, 0.2],
+            [0.1, -0.5],
             [-0.3,0.2]
         ]
 
+        # Waypoints at the museum 
         """  
         self.waypoints = [
             [0.75, 0.2],
-            [1.48, 0.1],   # [2.48, 0.1]
-            [4.6, 1.2],   # Define B, C, D coords here
+            [1.48, 0.1],
+            [4.6, 1.2],
             [7, 2.3]
         ]
         """
@@ -50,10 +52,9 @@ class SimpleWaypointNavigator(Node):
         # Navigation parameters
         self.linear_speed = 0.16  # m/s
         self.rotation_speed = 0.22  # m/s
-        self.move_duration = 1.0  # seconds
+        self.move_duration_max = 0.1  # seconds
+        self.rotation_duration_max = 0.5  # seconds
         self.waypoint_tolerance = 0.1  # meters
-        self.obstacle_check_distance = 1.0  # meters
-        self.obstacle_check_angle = 30.0  # degrees (total cone)
         self.waypoint_pause_duration = 10.0  # seconds
 
         # State management
@@ -89,10 +90,21 @@ class SimpleWaypointNavigator(Node):
             self.get_logger().info('Button pressed! Starting navigation...')
             self.state = NavigationState.INITIALIZING_AMCL
             self.send_initial_pose()
+        elif msg.data and self.state == NavigationState.STOPPED:
+            if not self.amcl_initialized:
+                self.get_logger().error('AMCL not initialized. Cant restart!!!')
+                return
+            else:
+                self.button_on = True
+                self.get_logger().info('Button pressed! Continuing navigation...')
+                if self.amcl_pose is None:
+                    self.get_logger().error('NO AMCL DATA!!!')
+                else:
+                    self.state = NavigationState.INITIALIZING_AMCL
+                    self.send_pose(self.amcl_pose)
         elif not msg.data and self.button_on:
             self.button_on = False
-            self.state = NavigationState.WAITING_FOR_START
-            self.current_waypoint_idx = 0
+            self.state = NavigationState.STOPPED
             self.get_logger().info('Button OFF detected, stopping navigation.')
 
     def send_initial_pose(self):
@@ -110,7 +122,6 @@ class SimpleWaypointNavigator(Node):
         initial_pose_msg.pose.pose.orientation.z = q[2]
         initial_pose_msg.pose.pose.orientation.w = q[3]
         # Covariance small for certainty
-        # initial_pose_msg.pose.covariance = [0.01]*36
         initial_pose_msg.pose.covariance = [
             0.005, 0,     0,     0,     0,     0,    # variance x
             0,     0.005, 0,     0,     0,     0,    # variance y
@@ -120,38 +131,32 @@ class SimpleWaypointNavigator(Node):
             0,     0,     0,     0,     0,     0.05 # yaw variance
         ]
         self.initial_pose_pub.publish(initial_pose_msg)
-        self.get_logger().info('Initial pose published. Waiting 5 seconds for AMCL stabilization.')
+        self.get_logger().info('Initial pose published. Waiting 10 seconds for AMCL stabilization.')
 
-        # Wait for 5 seconds as specified
         self.initialization_start_time = self.get_clock().now()
         self.state = NavigationState.WAITING_FOR_AMCL
 
         self.amcl_initialized = False  # Reset till next message
-
-        # Wait here 5 seconds
-        time.sleep(5.0)
                    
     def send_pose(self,pose):
-        # Publish initial pose to AMCL
+        # Publish given pose to AMCL
         pose_msg = PoseWithCovarianceStamped()
         pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.header.frame_id = 'map'
-        pose_msg.pose.pose = pose
+        pose_msg.pose.pose.position = pose.position
+
+        pose_msg.pose.pose.orientation = pose.orientation
 
         # Covariance small for certainty
-        pose_msg.pose.covariance = [0.01]*36
+        pose_msg.pose.covariance = [0.001]*36
 
         self.initial_pose_pub.publish(pose_msg)
-        self.get_logger().info('Last known pose published. Waiting 5 seconds for AMCL stabilization.')
+        self.get_logger().info('Last known pose published. Waiting 10 seconds for AMCL stabilization.')
 
-        # Wait for 5 seconds as specified
         self.initialization_start_time = self.get_clock().now()
         self.state = NavigationState.WAITING_FOR_AMCL
 
         self.amcl_initialized = False  # Reset till next message
-
-        # Wait here 5 seconds
-        time.sleep(5.0)
 
     def amcl_pose_callback(self, msg):
         self.amcl_pose = msg.pose.pose
@@ -212,6 +217,10 @@ class SimpleWaypointNavigator(Node):
             # Do nothing, wait for button press
             return
 
+        elif self.state == NavigationState.STOPPED:
+            # Do nothing, wait for button press
+            return
+
         elif self.state == NavigationState.WAITING_FOR_AMCL:
             # Wait for 10 seconds, then check if AMCL is initialized
             elapsed = (current_time - self.initialization_start_time).nanoseconds / 1e9
@@ -222,15 +231,20 @@ class SimpleWaypointNavigator(Node):
                     self.state = NavigationState.NAVIGATING
                 else:
                     self.get_logger().error('AMCL failed to initialize properly. Retrying')
-                    self.send_initial_pose()
+                    if self.amcl_pose is None:
+                        self.send_initial_pose()
+                    else:
+                        self.send_pose(self.amcl_pose)
 
         elif self.state == NavigationState.NAVIGATING:
+            # Safety check for max allowed duration of movement
             # Check if we need to stop previous movement
             if (self.last_move_time is not None and 
                 hasattr(self, 'move_duration_remaining')):
                 elapsed = (current_time - self.last_move_time).nanoseconds / 1e9
                 if elapsed >= self.move_duration_remaining:
                     self.stop_robot()
+                    self.get_logger().info('Max time elapsed. Stopping movement for safety')
                     self.last_move_time = None
 
             # Only proceed if we're not currently moving
@@ -239,25 +253,24 @@ class SimpleWaypointNavigator(Node):
 
         elif self.state == NavigationState.AT_WAYPOINT:
             # Wait at waypoint for specified duration
-            if self.waypoint_reached_time is not None:
-                elapsed = (current_time - self.waypoint_reached_time).nanoseconds / 1e9
-                if elapsed >= self.waypoint_pause_duration:
-                    self.get_logger().info('Waypoint pause completed, continuing...')
+            elapsed = (current_time - self.waypoint_reached_time).nanoseconds / 1e9
+            if elapsed >= self.waypoint_pause_duration:
+                self.get_logger().info('Waypoint pause completed, continuing...')
 
-                    if self.forward:
-                        self.current_waypoint_idx += 1
-                        if self.current_waypoint_idx >= len(self.waypoints) - 1:
-                            self.forward = False
-                    else:
-                        self.current_waypoint_idx -= 1
-                        if self.current_waypoint_idx <= 0:
-                            self.forward = True
+                if self.forward:
+                    self.current_waypoint_idx += 1
+                    if self.current_waypoint_idx >= len(self.waypoints) - 1:
+                        self.forward = False
+                else:
+                    self.current_waypoint_idx -= 1
+                    if self.current_waypoint_idx <= 0:
+                        self.forward = True
                     
-                    self.state = NavigationState.NAVIGATING
-                    self.waypoint_reached_time = None
+                self.state = NavigationState.NAVIGATING
+                self.waypoint_reached_time = None
 
         elif self.state == NavigationState.COMPLETED:
-            # Navigation completed, do nothing
+            # Not implemented yet
             pass
 
     def is_obstacle_in_box(self):
@@ -325,12 +338,12 @@ class SimpleWaypointNavigator(Node):
         # If we need to turn significantly, turn first
         if abs(angular_error) > math.radians(10):  # 10 degrees threshold
             angular_vel = self.rotation_speed if angular_error > 0 else -self.rotation_speed
-            self.get_logger().info(f'Turning towards waypoint, angular error: {math.degrees(angular_error):.1f} degrees')
-            self.send_twist_command(0.0, angular_vel, 0.0, 0.2)  # Turn for 0.5 seconds
+            self.get_logger().info(f'Turning towards waypoint {self.current_waypoint_idx}, angular error: {math.degrees(angular_error):.1f} degrees')
+            self.send_twist_command(0.0, angular_vel, 0.0, self.rotation_duration_max)
         else:
             # Move forward towards waypoint
             self.get_logger().info(f'Moving towards waypoint {self.current_waypoint_idx}: {target_waypoint}')
-            self.send_twist_command(self.linear_speed, 0.0, angular_error, self.move_duration) 
+            self.send_twist_command(self.linear_speed, 0.0, angular_error, self.move_duration_max) 
 
 def main(args=None):
     rclpy.init(args=args)
