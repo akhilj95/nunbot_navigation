@@ -264,7 +264,8 @@ class SimpleWaypointNavigator(Node):
                     self.stop_robot()
                     self.get_logger().info('Max time elapsed. Stopping movement for safety')
                     self.last_move_time = None
-
+            
+            # Checking battery state
             if self.rpi_battery_low or self.base_battery_low:
                 self.get_logger().warning('Low battery do not continue moving...')
                 return
