@@ -95,11 +95,12 @@ class SimpleWaypointNavigator(Node):
 
         # Check if Rpi battery is critical
         # Make sure sudo visudo is edited to make it work without password
-        if battery_voltages[0] < 13.2:
+        if battery_voltages[0] < 13.5:
             self.get_logger().warning('CRITICAL: Battery voltage dangerously low! Shutting down...')
             self.stop_robot()
             time.sleep(0.5)  # Ensure stop command publishes
-            os.system("sudo shutdown -h now")
+            os.system("sudo shutdown -h +1")
+            time.sleep(100)  # Ensure doesn't come back here before 1 min
             return
 
         # Check first battery voltage and update state
