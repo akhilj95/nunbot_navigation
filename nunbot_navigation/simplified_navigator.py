@@ -55,7 +55,7 @@ class SimpleWaypointNavigator(Node):
         self.rotation_duration_max = 0.5  # seconds
         self.waypoint_tolerance = 0.1  # meters
         self.waypoint_pause_duration = 10.0  # seconds
-        self.low_voltage_threshold = 14 # volts
+        self.low_voltage_threshold = 14.2 # volts
 
         # State management
         self.state = NavigationState.WAITING_FOR_START
