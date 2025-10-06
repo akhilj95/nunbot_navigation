@@ -1,53 +1,140 @@
+#!/usr/bin/env python3
+
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
-from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Bool
 import tf2_ros
 import math
 import time
+import tf_transformations
+from enum import Enum
+import numpy as np
 
-class SimpleNavNode(Node):
+# ROS2 message imports
+from geometry_msgs.msg import Twist, PoseWithCovarianceStamped, PoseStamped
+from nav_msgs.msg import OccupancyGrid
+from std_msgs.msg import Bool, Float32MultiArray
+
+class NavigationState(Enum):
+    WAITING_FOR_START = 1
+    INITIALIZING_AMCL = 2
+    WAITING_FOR_AMCL = 3
+    NAVIGATING = 4
+    AT_WAYPOINT = 5
+    STOPPED = 6
+
+class SimpleWaypointNavigator(Node):
     def __init__(self):
-        super().__init__('simple_nav_node')
+        super().__init__('simple_waypoint_navigator')
 
-        # Parameters and state
-        self.initial_pose = [0.0, 0.0, 0.0]  # Set initial known pose coords (point A)
+        # Initial Map pose
+        self.initial_pose = [0.0, 0.0, 0.0]  # x,y, theta
+        
+        # Waypoints at the lab 
         self.waypoints = [
-            [0.1, 0.1],   # Start
-            [-0.5, -0.5],   # Define B, C, D coords here
-            [0, 0]    # Return to A
+            [0.75, 0.5],
+            [0.1, -0.5],
+            [-0.3,0.2]
         ]
-        self.current_waypoint_idx = 1
-        self.amcl_pose = None
+
+        # Waypoints at the museum 
+        """  
+        self.waypoints = [
+            [0.75, 0.2],
+            [1.48, 0.1],
+            [4.6, 1.2],
+            [7, 2.3]
+        ]
+        """
+        self.current_waypoint_idx = 0
+        self.forward = True  # for traversing waypoints list in forward/backward 
+
+        # Navigation parameters
+        self.linear_speed = 0.16  # m/s
+        self.rotation_speed = 0.22  # m/s
+        self.move_duration_max = 0.1  # seconds
+        self.rotation_duration_max = 0.5  # seconds
+        self.waypoint_tolerance = 0.1  # meters
+        self.waypoint_pause_duration = 10.0  # seconds
+        self.low_voltage_threshold = 14.2 # volts
+
+        # State management
+        self.state = NavigationState.WAITING_FOR_START
         self.button_on = False
         self.amcl_initialized = False
+        self.amcl_pose = None
+        self.last_move_time = None 
+        self.move_duration_remaining = None
+        self.waypoint_reached_time = None
+        self.rpi_battery_low = False
+        self.base_battery_low = False
 
         # Subscribers
         self.create_subscription(Bool, '/nunbot/button_onoff', self.button_callback, 10)
+        self.create_subscription(Float32MultiArray, '/nunbot/voltage', self.battery_callback, 10)
         self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.amcl_pose_callback, 10)
-        self.create_subscription(OccupancyGrid, '/local_costmap/costmap', self.costmap_callback, 10)
+        self.create_subscription(OccupancyGrid, '/local_costmap/costmap', self.costmap_callback, 5)
 
         # Publishers
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
 
         # Timer for main loop
-        self.timer = self.create_timer(0.5, self.main_loop)
+        self.timer = self.create_timer(0.1, self.navigation_loop)
 
         # Costmap data placeholder
         self.latest_costmap = None
 
         self.get_logger().info('Simple Navigation Node initialized.')
+        self.get_logger().info(f'Waypoints: {self.waypoints}')
+
+    def battery_callback(self, msg):
+        """Handle battery info"""
+        battery_voltages = msg.data
+
+        # Check first battery voltage and update state
+        if battery_voltages[0] <= self.low_voltage_threshold:
+            if not self.rpi_battery_low:  # Only log on state change
+                self.get_logger().warning(f'RPI battery low: {battery_voltages[0]:.2f}V')
+            self.rpi_battery_low = True
+        elif battery_voltages[0] > self.low_voltage_threshold + 0.5:
+            # Recovering only if voltage is significantly higher
+            if self.rpi_battery_low:  # Only log on state change
+                self.get_logger().info(f'RPI battery recovered: {battery_voltages[0]:.2f}V')
+            self.rpi_battery_low = False
+
+        # Check second battery voltage and update state
+        if battery_voltages[1] <= self.low_voltage_threshold:
+            if not self.base_battery_low:  # Only log on state change
+                self.get_logger().warning(f'Base battery low: {battery_voltages[1]:.2f}V')
+            self.base_battery_low = True
+        elif battery_voltages[1] > self.low_voltage_threshold + 0.5:
+            # Recovering only if voltage is significantly higher
+            if self.base_battery_low:  # Only log on state change
+                self.get_logger().info(f'Base battery recovered: {battery_voltages[1]:.2f}V')
+            self.base_battery_low = False
 
     def button_callback(self, msg):
-        if msg.data and not self.button_on:
+        """Handle button press to start navigation"""
+        if msg.data and self.state == NavigationState.WAITING_FOR_START:
             self.button_on = True
-            self.get_logger().info('Button ON detected, starting navigation...')
+            self.get_logger().info('Button pressed! Starting navigation...')
+            self.state = NavigationState.INITIALIZING_AMCL
             self.send_initial_pose()
+        elif msg.data and self.state == NavigationState.STOPPED:
+            if not self.amcl_initialized:
+                self.get_logger().error('AMCL not initialized. Cant restart!!!')
+                return
+            else:
+                self.button_on = True
+                self.get_logger().info('Button pressed! Continuing navigation...')
+                if self.amcl_pose is None:
+                    self.get_logger().error('NO AMCL DATA!!!')
+                else:
+                    self.state = NavigationState.INITIALIZING_AMCL
+                    self.send_pose(self.amcl_pose)
         elif not msg.data and self.button_on:
             self.button_on = False
+            self.state = NavigationState.STOPPED
             self.get_logger().info('Button OFF detected, stopping navigation.')
 
     def send_initial_pose(self):
@@ -57,177 +144,250 @@ class SimpleNavNode(Node):
         initial_pose_msg.header.frame_id = 'map'
         initial_pose_msg.pose.pose.position.x = self.initial_pose[0]
         initial_pose_msg.pose.pose.position.y = self.initial_pose[1]
+
         # Orientation from theta angle (yaw)
-        import tf_transformations
         q = tf_transformations.quaternion_from_euler(0, 0, self.initial_pose[2])
         initial_pose_msg.pose.pose.orientation.x = q[0]
         initial_pose_msg.pose.pose.orientation.y = q[1]
         initial_pose_msg.pose.pose.orientation.z = q[2]
         initial_pose_msg.pose.pose.orientation.w = q[3]
         # Covariance small for certainty
-        initial_pose_msg.pose.covariance = [0.0]*36
+        initial_pose_msg.pose.covariance = [
+            0.005, 0,     0,     0,     0,     0,    # variance x
+            0,     0.005, 0,     0,     0,     0,    # variance y
+            0,     0,     1e6,   0,     0,     0,    # z variance very high (unknown)
+            0,     0,     0,     1e6,   0,     0,    # roll variance very high (unknown)
+            0,     0,     0,     0,     1e6,   0,    # pitch variance very high (unknown)
+            0,     0,     0,     0,     0,     0.05 # yaw variance
+        ]
         self.initial_pose_pub.publish(initial_pose_msg)
         self.get_logger().info('Initial pose published. Waiting 10 seconds for AMCL stabilization.')
-        self.amcl_initialized = False  # Reset
-        # Wait here 10 seconds
-        time.sleep(10.0)
-        
+
+        self.initialization_start_time = self.get_clock().now()
+        self.state = NavigationState.WAITING_FOR_AMCL
+
+        self.amcl_initialized = False  # Reset till next message
+                   
+    def send_pose(self,pose):
+        # Publish given pose to AMCL
+        pose_msg = PoseWithCovarianceStamped()
+        pose_msg.header.stamp = self.get_clock().now().to_msg()
+        pose_msg.header.frame_id = 'map'
+        pose_msg.pose.pose.position = pose.position
+
+        pose_msg.pose.pose.orientation = pose.orientation
+
+        # Covariance small for certainty
+        pose_msg.pose.covariance = [0.001]*36
+
+        self.initial_pose_pub.publish(pose_msg)
+        self.get_logger().info('Last known pose published. Waiting 10 seconds for AMCL stabilization.')
+
+        self.initialization_start_time = self.get_clock().now()
+        self.state = NavigationState.WAITING_FOR_AMCL
+
+        self.amcl_initialized = False  # Reset till next message
+
     def amcl_pose_callback(self, msg):
         self.amcl_pose = msg.pose.pose
         # Consider AMCL initialized if pose received
         if not self.amcl_initialized:
             self.amcl_initialized = True
-            
-        self.get_logger().info('AMCL pose data received.')
+            self.get_logger().info('First AMCL pose data received.')
 
     def costmap_callback(self, msg):
         self.latest_costmap = msg
 
-    def main_loop(self):
-        if not self.button_on or not self.amcl_initialized or self.latest_costmap is None:
-            # Wait for start, AMCL init, and costmap readiness
-            return
+    def get_yaw_from_quaternion(self, q):
+        # Convert quaternion to yaw angle
+        euler = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
+        return euler[2]
 
-        # Check obstacle in a 30 degree cone and 1m range
-        if self.is_obstacle_in_cone():
-            self.get_logger().info('Obstacle detected in path. Robot stopped.')
-            self.publish_twist(0.0, 0.0)
-            return
+    def calculate_distance(self, pos1, pos2):
+        """Calculate Euclidean distance between two points"""
+        return math.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
 
-        # Get current pose - using latest amcl_pose
-        if self.amcl_pose is None:
-            self.get_logger().warning('No AMCL pose available yet.')
-            return
+    def calculate_direction_to_waypoint(self, current_pos, target_waypoint):
+        """Calculate the direction (angle) to the next waypoint"""
+        dx = target_waypoint[0] - current_pos[0]
+        dy = target_waypoint[1] - current_pos[1]
+        return math.atan2(dy, dx)
 
-        robot_x = self.amcl_pose.position.x
-        robot_y = self.amcl_pose.position.y
-        robot_yaw = self.get_yaw_from_quaternion(self.amcl_pose.orientation)
+    def normalize_angle(self, angle):
+        """Normalize angle to [-pi, pi]"""
+        angle = (angle + math.pi) % (2 * math.pi) - math.pi
+        return angle
 
-        # Target waypoint coords
-        target_x, target_y = self.waypoints[self.current_waypoint_idx]
-
-        # Check distance to target
-        dist = math.sqrt((target_x - robot_x)**2 + (target_y - robot_y)**2)
-        if dist < 0.15:
-            # Reached waypoint, stop and wait
-            self.get_logger().info(f'Waypoint {self.current_waypoint_idx} reached. Waiting for 200 seconds.')
-            self.publish_twist(0.0, 0.0)
-            time.sleep(200.0)
-            self.current_waypoint_idx += 1
-            if self.current_waypoint_idx >= len(self.waypoints):
-                self.get_logger().info('All waypoints visited. Navigation complete.')
-                self.button_on = False
-            return
-
-        # Compute direction angle to waypoint
-        target_angle = math.atan2(target_y - robot_y, target_x - robot_x)
-        angle_diff = self.angle_diff(target_angle, robot_yaw)
-
-        # For simplicity, only move linearly straight (ignore rotation commands)
-        linear_speed = 0.17
-        self.publish_twist(linear_speed, 0.0)
-
-        # Move for 1 second then stop
-        time.sleep(1.0)
-        self.publish_twist(0.0, 0.0)
-
-    def publish_twist(self, linear_x, angular_z):
+    def send_twist_command(self, linear_vel, angular_vel, direction, duration):
+        """Send twist command for specified duration"""
         twist = Twist()
-        twist.linear.x = linear_x
-        twist.angular.z = angular_z
+        twist.linear.x = linear_vel * math.cos(direction)
+        twist.linear.y = linear_vel * math.sin(direction)
+        twist.angular.z = angular_vel
         self.cmd_vel_pub.publish(twist)
 
-    def is_obstacle_in_cone(self):
-        # Process latest_costmap to detect obstacles in 30 deg cone, 1m range in front
+        # Store time when command was sent
+        self.last_move_time = self.get_clock().now()
+        self.move_duration_remaining = duration
+    
+    def stop_robot(self):
+        """Send stop command"""
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.linear.y = 0.0
+        twist.angular.z = 0.0
+        self.cmd_vel_pub.publish(twist)
+
+    def navigation_loop(self):
+        """Main navigation loop called at 10Hz"""
+        current_time = self.get_clock().now()
+
+        if self.state == NavigationState.WAITING_FOR_START:
+            # Do nothing, wait for button press
+            return
+
+        elif self.state == NavigationState.STOPPED:
+            # Do nothing, wait for button press
+            return
+
+        elif self.state == NavigationState.WAITING_FOR_AMCL:
+            # Wait for 10 seconds, then check if AMCL is initialized
+            elapsed = (current_time - self.initialization_start_time).nanoseconds / 1e9
+
+            if elapsed > 10.0:  # 10 seconds elapsed
+                if self.amcl_initialized:
+                    self.get_logger().info('AMCL initialized successfully!')
+                    self.state = NavigationState.NAVIGATING
+                else:
+                    self.get_logger().error('AMCL failed to initialize properly. Retrying')
+                    if self.amcl_pose is None:
+                        self.send_initial_pose()
+                    else:
+                        self.send_pose(self.amcl_pose)
+
+        elif self.state == NavigationState.NAVIGATING:
+            # Safety check for max allowed duration of movement
+            # Check if we need to stop previous movement
+            if self.last_move_time is not None and self.move_duration_remaining is not None:
+                elapsed = (current_time - self.last_move_time).nanoseconds / 1e9
+                if elapsed >= self.move_duration_remaining:
+                    self.stop_robot()
+                    self.get_logger().info('Max time elapsed. Stopping movement for safety')
+                    self.last_move_time = None
+            
+            # Checking battery state
+            if self.rpi_battery_low or self.base_battery_low:
+                self.get_logger().warning('Low battery do not continue moving...')
+                return
+
+            # Only proceed if we're not currently moving and battery ok
+            if self.last_move_time is None:
+                self.execute_navigation_step()
+
+        elif self.state == NavigationState.AT_WAYPOINT:
+            # Wait at waypoint for specified duration
+            if self.waypoint_reached_time is not None:
+                elapsed = (current_time - self.waypoint_reached_time).nanoseconds / 1e9
+                if elapsed >= self.waypoint_pause_duration:
+                    self.get_logger().info('Waypoint pause completed, continuing...')
+
+                    if self.forward:
+                        self.current_waypoint_idx += 1
+                        if self.current_waypoint_idx >= len(self.waypoints) - 1:
+                            self.forward = False
+                    else:
+                        self.current_waypoint_idx -= 1
+                        if self.current_waypoint_idx <= 0:
+                            self.forward = True
+                        
+                    self.state = NavigationState.NAVIGATING
+                    self.waypoint_reached_time = None
+
+    def is_obstacle_in_box(self):
         # Assuming costmap is an OccupancyGrid with info: resolution, width, height, origin
         costmap = self.latest_costmap
         if costmap is None:
-            return False
-
-        # Parameters for cone
-        cone_angle_rad = math.radians(30)
-        max_range = 1.0
-
+            self.get_logger().warning('Cannot get costmap')
+            return True
+        
         resolution = costmap.info.resolution
         width = costmap.info.width
         height = costmap.info.height
 
-        # Costmap origin pose (map frame)
-        origin_x = costmap.info.origin.position.x
-        origin_y = costmap.info.origin.position.y
-
         data = costmap.data
 
-        # Check cells in front cone of robot (simplified: local frame origin at robot)
-        # We'll check a semicircle area in front of the robot transformed to the costmap grid
-        # Since costmap is centered differently, calculation adapted as per costmap definition
+        # Convert costmap data (usually a flat list) into a numpy array with shape (height, width)
+        costmap_array = np.array(data).reshape((height, width))
 
-        # Check 1m radius in costmap cells
-        max_cells = int(max_range / resolution)
-
-        # Iterate over relevant cells within a square bounding the circle
-        # For this example, check cells in front half (x > 0) within cone angle
-        # Costmap origin is map frame, but we need robot frame points converted to map frame or vice versa.
-        # Simplified: Assume robot at center of costmap, which might not always be true - adjust accordingly.
-
-        # Convert robot map coordinates to costmap indices
-        # Robot is at origin in local frame, get robot map pose from AMCL
-        robot_pose = self.amcl_pose
-        if robot_pose is None:
+        # Check how many cells have values greater than 50
+        count_high_prob = np.sum(costmap_array > 50)
+        
+        # Check if atleast 10 cells have these
+        if count_high_prob >= 10:
+            return True
+        else:
             return False
 
-        robot_map_x = robot_pose.position.x
-        robot_map_y = robot_pose.position.y
-        robot_yaw = self.get_yaw_from_quaternion(robot_pose.orientation)
+    def execute_navigation_step(self):
+        """Execute one step of the navigation process"""
+        # Get current pose - using latest amcl_pose
+        if self.amcl_pose is None:
+            self.get_logger().warning('Cannot get current pose, skipping navigation step')
+            return
 
-        # Scan costmap cells in bounding box with offset by costmap origin
-        for i in range(width):
-            for j in range(height):
-                # Cell center coordinates in map frame
-                cell_x = origin_x + (i + 0.5) * resolution
-                cell_y = origin_y + (j + 0.5) * resolution
+        current_x = self.amcl_pose.position.x
+        current_y = self.amcl_pose.position.y
+        current_yaw = self.get_yaw_from_quaternion(self.amcl_pose.orientation)
 
-                # Vector from robot to cell
-                dx = cell_x - robot_map_x
-                dy = cell_y - robot_map_y
-                dist = math.sqrt(dx * dx + dy * dy)
-                if dist > max_range or dist == 0.0:
-                    continue
+        target_waypoint = self.waypoints[self.current_waypoint_idx]
 
-                # Angle in robot frame, normalize between -pi, pi
-                angle = math.atan2(dy, dx) - robot_yaw
-                angle = (angle + math.pi) % (2 * math.pi) - math.pi
+        # Check if we've reached the current waypoint
+        distance_to_waypoint = self.calculate_distance(
+            (current_x, current_y), target_waypoint)
 
-                if abs(angle) <= cone_angle_rad / 2.0:
-                    # Check costmap cell occupancy > threshold (e.g. 50)
-                    idx = j * width + i
-                    if data[idx] > 50:
-                        return True
+        if distance_to_waypoint <= self.waypoint_tolerance:
+            self.get_logger().info(
+                f'Reached waypoint {self.current_waypoint_idx}: {target_waypoint}')
+            self.state = NavigationState.AT_WAYPOINT
+            self.waypoint_reached_time = self.get_clock().now()
+            return
 
-        return False
+        # Check for obstacles
+        if self.is_obstacle_in_box():
+            self.get_logger().warning('Obstacle detected! Stopping.')
+            self.stop_robot()
+            return
 
-    def get_yaw_from_quaternion(self, q):
-        # Convert quaternion to yaw angle
-        import tf_transformations
-        euler = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
-        return euler[2]
+        # Calculate direction to waypoint
+        target_direction = self.calculate_direction_to_waypoint(
+            (current_x, current_y), target_waypoint)
 
-    def angle_diff(self, a, b):
-        # Calculate shortest angle difference between a and b in radians
-        diff = a - b
-        while diff > math.pi:
-            diff -= 2 * math.pi
-        while diff < -math.pi:
-            diff += 2 * math.pi
-        return diff
+        # Calculate angular error
+        angular_error = self.normalize_angle(target_direction - current_yaw)
 
+        # If we need to turn significantly, turn first
+        if abs(angular_error) > math.radians(10):  # 10 degrees threshold
+            angular_vel = self.rotation_speed if angular_error > 0 else -self.rotation_speed
+            self.get_logger().info(f'Turning towards waypoint {self.current_waypoint_idx}, angular error: {math.degrees(angular_error):.1f} degrees')
+            self.send_twist_command(0.0, angular_vel, 0.0, self.rotation_duration_max)
+        else:
+            # Move forward towards waypoint
+            self.get_logger().info(f'Moving towards waypoint {self.current_waypoint_idx}: {target_waypoint}')
+            self.send_twist_command(self.linear_speed, 0.0, angular_error, self.move_duration_max) 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = SimpleNavNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+
+    navigator = SimpleWaypointNavigator()
+
+    try:
+        rclpy.spin(navigator)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        navigator.destroy_node()
+        rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

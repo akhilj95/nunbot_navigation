@@ -12,7 +12,7 @@ import numpy as np
 # ROS2 message imports
 from geometry_msgs.msg import Twist, PoseWithCovarianceStamped, PoseStamped
 from nav_msgs.msg import OccupancyGrid
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float32MultiArray
 
 class NavigationState(Enum):
     WAITING_FOR_START = 1
@@ -20,14 +20,13 @@ class NavigationState(Enum):
     WAITING_FOR_AMCL = 3
     NAVIGATING = 4
     AT_WAYPOINT = 5
-    COMPLETED = 6
-    STOPPED = 7
+    STOPPED = 6
 
 class SimpleWaypointNavigator(Node):
     def __init__(self):
         super().__init__('simple_waypoint_navigator')
 
-        # Parameters and state
+        # Initial Map pose
         self.initial_pose = [0.0, 0.0, 0.0]  # x,y, theta
         
         # Waypoints at the lab 
@@ -56,6 +55,7 @@ class SimpleWaypointNavigator(Node):
         self.rotation_duration_max = 0.5  # seconds
         self.waypoint_tolerance = 0.1  # meters
         self.waypoint_pause_duration = 10.0  # seconds
+        self.low_voltage_threshold = 14.2 # volts
 
         # State management
         self.state = NavigationState.WAITING_FOR_START
@@ -63,10 +63,14 @@ class SimpleWaypointNavigator(Node):
         self.amcl_initialized = False
         self.amcl_pose = None
         self.last_move_time = None 
+        self.move_duration_remaining = None
         self.waypoint_reached_time = None
+        self.rpi_battery_low = False
+        self.base_battery_low = False
 
         # Subscribers
         self.create_subscription(Bool, '/nunbot/button_onoff', self.button_callback, 10)
+        self.create_subscription(Float32MultiArray, '/nunbot/voltage', self.battery_callback, 10)
         self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.amcl_pose_callback, 10)
         self.create_subscription(OccupancyGrid, '/local_costmap/costmap', self.costmap_callback, 5)
 
@@ -82,6 +86,32 @@ class SimpleWaypointNavigator(Node):
 
         self.get_logger().info('Simple Navigation Node initialized.')
         self.get_logger().info(f'Waypoints: {self.waypoints}')
+
+    def battery_callback(self, msg):
+        """Handle battery info"""
+        battery_voltages = msg.data
+
+        # Check first battery voltage and update state
+        if battery_voltages[0] <= self.low_voltage_threshold:
+            if not self.rpi_battery_low:  # Only log on state change
+                self.get_logger().warning(f'RPI battery low: {battery_voltages[0]:.2f}V')
+            self.rpi_battery_low = True
+        elif battery_voltages[0] > self.low_voltage_threshold + 0.5:
+            # Recovering only if voltage is significantly higher
+            if self.rpi_battery_low:  # Only log on state change
+                self.get_logger().info(f'RPI battery recovered: {battery_voltages[0]:.2f}V')
+            self.rpi_battery_low = False
+
+        # Check second battery voltage and update state
+        if battery_voltages[1] <= self.low_voltage_threshold:
+            if not self.base_battery_low:  # Only log on state change
+                self.get_logger().warning(f'Base battery low: {battery_voltages[1]:.2f}V')
+            self.base_battery_low = True
+        elif battery_voltages[1] > self.low_voltage_threshold + 0.5:
+            # Recovering only if voltage is significantly higher
+            if self.base_battery_low:  # Only log on state change
+                self.get_logger().info(f'Base battery recovered: {battery_voltages[1]:.2f}V')
+            self.base_battery_low = False
 
     def button_callback(self, msg):
         """Handle button press to start navigation"""
@@ -168,7 +198,6 @@ class SimpleWaypointNavigator(Node):
     def costmap_callback(self, msg):
         self.latest_costmap = msg
 
-
     def get_yaw_from_quaternion(self, q):
         # Convert quaternion to yaw angle
         euler = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
@@ -239,39 +268,40 @@ class SimpleWaypointNavigator(Node):
         elif self.state == NavigationState.NAVIGATING:
             # Safety check for max allowed duration of movement
             # Check if we need to stop previous movement
-            if (self.last_move_time is not None and 
-                hasattr(self, 'move_duration_remaining')):
+            if self.last_move_time is not None and self.move_duration_remaining is not None:
                 elapsed = (current_time - self.last_move_time).nanoseconds / 1e9
                 if elapsed >= self.move_duration_remaining:
                     self.stop_robot()
                     self.get_logger().info('Max time elapsed. Stopping movement for safety')
                     self.last_move_time = None
+            
+            # Checking battery state
+            if self.rpi_battery_low or self.base_battery_low:
+                self.get_logger().warning('Low battery do not continue moving...')
+                return
 
-            # Only proceed if we're not currently moving
+            # Only proceed if we're not currently moving and battery ok
             if self.last_move_time is None:
                 self.execute_navigation_step()
 
         elif self.state == NavigationState.AT_WAYPOINT:
             # Wait at waypoint for specified duration
-            elapsed = (current_time - self.waypoint_reached_time).nanoseconds / 1e9
-            if elapsed >= self.waypoint_pause_duration:
-                self.get_logger().info('Waypoint pause completed, continuing...')
+            if self.waypoint_reached_time is not None:
+                elapsed = (current_time - self.waypoint_reached_time).nanoseconds / 1e9
+                if elapsed >= self.waypoint_pause_duration:
+                    self.get_logger().info('Waypoint pause completed, continuing...')
 
-                if self.forward:
-                    self.current_waypoint_idx += 1
-                    if self.current_waypoint_idx >= len(self.waypoints) - 1:
-                        self.forward = False
-                else:
-                    self.current_waypoint_idx -= 1
-                    if self.current_waypoint_idx <= 0:
-                        self.forward = True
-                    
-                self.state = NavigationState.NAVIGATING
-                self.waypoint_reached_time = None
-
-        elif self.state == NavigationState.COMPLETED:
-            # Not implemented yet
-            pass
+                    if self.forward:
+                        self.current_waypoint_idx += 1
+                        if self.current_waypoint_idx >= len(self.waypoints) - 1:
+                            self.forward = False
+                    else:
+                        self.current_waypoint_idx -= 1
+                        if self.current_waypoint_idx <= 0:
+                            self.forward = True
+                        
+                    self.state = NavigationState.NAVIGATING
+                    self.waypoint_reached_time = None
 
     def is_obstacle_in_box(self):
         # Assuming costmap is an OccupancyGrid with info: resolution, width, height, origin
