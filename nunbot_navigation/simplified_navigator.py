@@ -272,7 +272,7 @@ class SimpleWaypointNavigator(Node):
                 elapsed = (current_time - self.last_move_time).nanoseconds / 1e9
                 if elapsed >= self.move_duration_remaining:
                     self.stop_robot()
-                    self.get_logger().info('Max time elapsed. Stopping movement for safety')
+                    # self.get_logger().info('Max time elapsed. Stopping movement for safety')
                     self.last_move_time = None
             
             # Checking battery state

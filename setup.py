@@ -21,7 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'simple_nav_node = nunbot_navigation.simple_nav_node:main',
-            'simple_waypoint_navigator = nunbot_navigation.simple_waypoint_navigator:main',
+            'old_simplified_navigator = nunbot_navigation.old_simplified_navigator:main',
             'simplified_navigator = nunbot_navigation.simplified_navigator:main',
             'test_navigation = nunbot_navigation.test_navigation:main',
         ],
