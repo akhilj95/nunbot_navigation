@@ -108,7 +108,7 @@ class SimpleWaypointNavigator(Node):
             if not self.rpi_battery_low:  # Only log on state change
                 self.get_logger().warning(f'RPI battery low: {battery_voltages[0]:.2f}V')
             self.rpi_battery_low = True
-        elif battery_voltages[0] > self.low_voltage_threshold_rpi + 0.7:
+        elif battery_voltages[0] > self.low_voltage_threshold_rpi + 0.8:
             # Recovering only if voltage is significantly higher
             if self.rpi_battery_low:  # Only log on state change
                 self.get_logger().info(f'RPI battery recovered: {battery_voltages[0]:.2f}V')
@@ -119,7 +119,7 @@ class SimpleWaypointNavigator(Node):
             if not self.base_battery_low:  # Only log on state change
                 self.get_logger().warning(f'Base battery low: {battery_voltages[1]:.2f}V')
             self.base_battery_low = True
-        elif battery_voltages[1] > self.low_voltage_threshold_base + 0.7:
+        elif battery_voltages[1] > self.low_voltage_threshold_base + 0.8:
             # Recovering only if voltage is significantly higher
             if self.base_battery_low:  # Only log on state change
                 self.get_logger().info(f'Base battery recovered: {battery_voltages[1]:.2f}V')
