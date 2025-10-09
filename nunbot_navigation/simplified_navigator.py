@@ -31,21 +31,23 @@ class SimpleWaypointNavigator(Node):
         self.initial_pose = [0.0, 0.0, 0.0]  # x,y, theta
         
         # Waypoints at the lab 
+        """  
         self.waypoints = [
             [0.75, 0.5],
             [0.1, -0.5],
             [-0.3,0.2]
         ]
-
-        # Waypoints at the museum 
-        """  
-        self.waypoints = [
-            [0.75, 0.2],
-            [1.48, 0.1],
-            [4.6, 1.2],
-            [7, 2.3]
-        ]
         """
+        # Waypoints at the museum 
+        self.waypoints = [
+            [0.75, -0.1],
+            [1.48, 0.1],
+            [2.8, 0.7],
+            [4.6, 1.2],
+            [6, 1.8],
+            [7.5, 2.3]
+        ]
+        
         self.current_waypoint_idx = 0
         self.forward = True  # for traversing waypoints list in forward/backward 
 
@@ -55,7 +57,7 @@ class SimpleWaypointNavigator(Node):
         self.move_duration_max = 0.1  # seconds
         self.rotation_duration_max = 0.5  # seconds
         self.waypoint_tolerance = 0.1  # meters
-        self.waypoint_pause_duration = 10.0  # seconds
+        self.waypoint_pause_duration = 30.0  # seconds
         self.low_voltage_threshold_rpi = 14 # volts
         self.low_voltage_threshold_base = 13.8 # volts
 
